@@ -193,8 +193,7 @@ class CausalConditionalCFM(ConditionalCFM):
         self.rand_noise = None
 
     @torch.inference_mode()
-    def forward(self, mu, mask, n_timesteps, temperature=1.0, spks=None, cond=None, noised_mels=None,
-                meanflow=False, prompt_len=0, flow_cache=None, carry_frames=0):
+    def forward(self, mu, mask, n_timesteps, temperature=1.0, spks=None, cond=None, noised_mels=None, meanflow=False):
         """Forward diffusion
 
         Args:
@@ -208,33 +207,9 @@ class CausalConditionalCFM(ConditionalCFM):
                 shape: (batch_size, spk_emb_dim)
             cond: Not used but kept for future purposes
             noised_mels: gt mels noised a time t
-            prompt_len: mel frames of the speaker prompt at the head of `mu`,
-                which `flow.inference` knows as `mel_len1`. The cache covers
-                this region too, because it sits in front of the carried frames
-                and every call re-feeds it.
-            flow_cache: (1, n_feats, prompt_len + carried, 2) of z and mu from
-                the previous call, as produced in the returned pair. Supplying
-                it is what makes chunked decoding continuous: the carried frames
-                start from the same noise *and* the same encoder output as last
-                time, so they render as the same audio instead of as a second
-                reading of the same words. Pinning the noise alone does not work
-                -- the flow encoder is bidirectional, so `mu` for one token
-                depends on the window it was encoded in.
-            carry_frames: how many trailing frames to hand to the next call.
-                Zero, the default, builds nothing and leaves this method exactly
-                as it behaved before the cache existed. The parent class carried
-                34 frames, which at `token_mel_ratio` of two is 17 speech tokens
-                or about 680 ms.
         Returns:
-            (sample, flow_cache): the mel-spectrogram and the state for the next
-                chunk. `flow_cache` is None when nothing was asked to be carried.
-
-        The caller owns the arithmetic: the next call must re-feed the prompt
-        and exactly `carry_frames / token_mel_ratio` tokens of overlap, so that
-        the cached frames land on the same tokens they were produced for. Note
-        that `finalize=False` trims `pre_lookahead_len` tokens off the tail of
-        `mu` in `flow.inference`, so the carried tail is the tail of what
-        survives that trim, not of what was fed in.
+            sample: generated mel-spectrogram
+                shape: (batch_size, n_feats, mel_timesteps)
         """
 
         B = mu.size(0)
@@ -243,21 +218,6 @@ class CausalConditionalCFM(ConditionalCFM):
         if noised_mels is not None:
             prompt_len = mu.size(2) - noised_mels.size(2)
             z[..., prompt_len:] = noised_mels
-
-        # Fix the prompt and the overlap to the noise and the encoder output
-        # they had last call. This is the parent class's formula, which that
-        # class raises out of before reaching.
-        carried = 0 if flow_cache is None else flow_cache.size(2)
-        if carried:
-            z[:, :, :carried] = flow_cache[:, :, :, 0]
-            mu[:, :, :carried] = flow_cache[:, :, :, 1]
-        next_cache = None
-        if carry_frames:
-            tail = min(carry_frames, mu.size(2))
-            next_cache = torch.stack([
-                torch.concat([z[:, :, :prompt_len], z[:, :, -tail:]], dim=2),
-                torch.concat([mu[:, :, :prompt_len], mu[:, :, -tail:]], dim=2),
-            ], dim=-1)
 
         # time steps for reverse diffusion
         t_span = torch.linspace(0, 1, n_timesteps + 1, device=mu.device, dtype=mu.dtype)
@@ -268,11 +228,9 @@ class CausalConditionalCFM(ConditionalCFM):
         #   because they were distilled with CFG outputs. We would need to add another hparam and
         #   change the conditional logic here if we want to use CFG inference with a meanflow model.
         if meanflow:
-            return self.basic_euler(z, t_span=t_span, mu=mu, mask=mask, spks=spks,
-                                    cond=cond), next_cache
+            return self.basic_euler(z, t_span=t_span, mu=mu, mask=mask, spks=spks, cond=cond), None
 
-        return self.solve_euler(z, t_span=t_span, mu=mu, mask=mask, spks=spks, cond=cond,
-                                meanflow=meanflow), next_cache
+        return self.solve_euler(z, t_span=t_span, mu=mu, mask=mask, spks=spks, cond=cond, meanflow=meanflow), None
 
     def basic_euler(self, x, t_span, mu, mask, spks, cond):
         in_dtype = x.dtype

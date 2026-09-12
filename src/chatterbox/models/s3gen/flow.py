@@ -140,9 +140,7 @@ class CausalMaskedDiffWithXvec(torch.nn.Module):
                   finalize,
                   n_timesteps=10,
                   noised_mels=None,
-                  meanflow=False,
-                  flow_cache=None,
-                  carry_frames=0):
+                  meanflow=False):
         # token: (B, n_toks)
         # token_len: (B,)
         B = token.size(0)
@@ -186,7 +184,7 @@ class CausalMaskedDiffWithXvec(torch.nn.Module):
         if mask.shape[0] != B:
             mask = mask.repeat(B, 1, 1)
 
-        feat, next_cache = self.decoder(
+        feat, _ = self.decoder(
             mu=h.transpose(1, 2).contiguous(),
             mask=mask,
             spks=embedding,
@@ -194,20 +192,7 @@ class CausalMaskedDiffWithXvec(torch.nn.Module):
             n_timesteps=n_timesteps,
             noised_mels=noised_mels,
             meanflow=meanflow,
-            # Not mel_len1. The generated frames begin where the prompt
-            # *tokens* end, at prompt_token x token_mel_ratio, and for this
-            # reference that is 410 while mel_len1 is 411 -- the prompt mel is
-            # not exactly twice the prompt token length, and upstream slices the
-            # output by the mel count anyway. The cache is written onto `mu`, so
-            # it has to use the token grid or it lands a frame off the tokens it
-            # was made for.
-            prompt_len=prompt_token.size(1) * self.token_mel_ratio,
-            flow_cache=flow_cache,
-            carry_frames=carry_frames,
         )
         feat = feat[:, :, mel_len1:]
         assert feat.shape[2] == mel_len2
-        # The second element is the decoder's carried state, empty unless a
-        # caller asked for it with `carry_frames`. Upstream returned None here
-        # and wondered why in a comment; this is what belongs in the slot.
-        return feat, next_cache
+        return feat, None  # NOTE jrm: why are they returning None here?

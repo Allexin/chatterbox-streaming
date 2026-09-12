@@ -111,38 +111,6 @@ def punc_norm(text: str) -> str:
     return text
 
 
-def quietest_cut(audio, search, frame):
-    """How much to hold back so the join lands in the quietest place nearby.
-
-    A chunk boundary is a switch between two independently vocoded renderings.
-    Inside a vowel the waveform is periodic and the ear hears the broken period
-    even when no sample jumps far, which is why measuring the step found nothing
-    while listening found a tick. In a pause there is no period to break.
-
-    So the boundary is moved backwards, never forwards -- audio beyond it has not
-    been decoded -- to the quietest frame within `search` samples of the end.
-    Measured on six joins of one utterance, a frame at a tenth of the loud level
-    sat a median of 195 ms back and never further than 380 ms.
-
-    Returns the number of samples to withhold, which is what the next chunk will
-    carry. Zero means the schedule's own boundary was already the quietest point.
-    """
-    search = min(search, len(audio) // 2)
-    if search < frame * 2:
-        return 0
-    region = audio[len(audio) - search:]
-    frames = len(region) // frame
-    if frames < 2:
-        return 0
-    energy = np.sqrt((region[:frames * frame].reshape(frames, frame) ** 2).mean(axis=1))
-    # The *last* frame that is quiet enough, not the quietest one. Through a
-    # pause every frame is a candidate and the earliest of them would withhold
-    # the whole pause for no gain; the latest puts the boundary just before the
-    # next sound starts and hands the next chunk as little as possible.
-    quiet = np.flatnonzero(energy <= energy.min() * 1.5 + 1e-4)
-    return int((frames - int(quiet[-1])) * frame) if len(quiet) else 0
-
-
 def audio_lead(prompt_feat_frames, prompt_tokens, token_mel_ratio, per_token):
     """Samples by which a window's audio starts after the token it was asked to start at.
 
@@ -167,16 +135,18 @@ def emit_from(sent, window_start, per_token, lead):
 def quietest_boundary(audio, search, per_token, lookahead=3):
     """How many whole tokens to leave to the next window, so the switch lands in a pause.
 
-    `quietest_cut` moves where the bytes are cut, and that turned out not to be
-    where the stream changes renderings: withheld audio is still this window's,
-    so the switch stays on the scheduled token. This moves the switch. The piece
+    A piece boundary is a switch between two independently rendered windows,
+    and inside a word that switch is audible; in a pause it is not. So the piece
     ends on a token boundary -- the one place two renderings of one token
     sequence line up by construction -- and the next window renders from there.
+    Holding audio back instead, as an earlier version did, only moves where the
+    bytes are cut: withheld audio is still the same window's.
 
     Each candidate boundary is scored by the level of the two tokens around it,
     80 ms, which is long enough that the closure of a stop consonant inside a
     word does not pass for a pause. The latest boundary within 1.5x of the
-    quietest wins, for the same reason as in `quietest_cut`.
+    quietest wins: through a pause every boundary qualifies, and the latest
+    hands the next window the least.
 
     Never fewer than `lookahead` tokens are left: the flow encoder looks three
     tokens ahead, and a window's last three are rendered without that, so they
@@ -205,40 +175,6 @@ def quietest_boundary(audio, search, per_token, lookahead=3):
         return lookahead + int(np.argmin(levels))
     quiet = np.flatnonzero(levels <= levels.min() * 1.5 + 1e-4)
     return lookahead + int(quiet[0])
-
-
-def splice(tail, overlap, following):
-    """Fade two renderings of the same speech across each other. Off by default.
-
-    The reasoning that produced this was wrong and the measurement is worth
-    keeping. The vocoder starts from noise, so decoding one token twice gives
-    two different waveforms -- which sounds like it should make a butt-joint
-    click. Measured at six joins, it does not: with `context_tokens` at 50 the
-    step at a hard cut has a median of 0.116 of the local amplitude against 0.167
-    for ordinary speech in the same file. The overlap does not merely give the
-    vocoder history, it makes the two renderings agree, because both are
-    conditioned on the same preceding tokens. Fading them then *raised* the
-    median step to 0.189, since blending two slightly out-of-phase copies puts a
-    kink at each end of the window.
-
-    So `crossfade_ms` defaults to zero and the joins are butted together, which
-    is what was measured good. What this is still for: it is the thing that would
-    make a *small* `context_tokens` safe. The overlap is the largest part of the
-    streaming overhead, and shrinking it is the obvious saving -- but with little
-    or no overlap the renderings stop agreeing, and then there is a step to fade.
-    Measure before turning it on.
-    """
-    if tail is None or not len(tail):
-        return np.concatenate([overlap, following])
-    if not len(overlap):
-        return np.concatenate([tail, following])
-    width = min(len(tail), len(overlap))
-    # Raised cosine: equal amplitude through the join for material this
-    # correlated, and no discontinuity in the slope at either end.
-    rising = 0.5 - 0.5 * np.cos(np.pi * (np.arange(width) + 0.5) / width)
-    joined = tail[-width:] * (1.0 - rising) + overlap[-width:] * rising
-    # Whatever of the tail is not faded is still audio somebody has to hear.
-    return np.concatenate([tail[:len(tail) - width], joined, following])
 
 
 @dataclass
@@ -493,43 +429,27 @@ class ChatterboxMultilingualTTS:
             watermarked_wav = self.watermarker.apply_watermark(wav, sample_rate=self.sr)
         return torch.from_numpy(watermarked_wav).unsqueeze(0)
 
-    def _vocode_window(self, tokens, drop_tail_tokens=0, noise=None,
-                       flow_cache=None, carry_frames=0, lead_samples=0):
-        """Vocode a window of speech tokens; return its audio and its carried state.
+    def _vocode_window(self, tokens, drop_tail_tokens=0, lead_samples=0):
+        """Vocode a window of speech tokens and return its audio.
 
-        A chunk is produced by decoding a window that reaches back into audio
-        already sent, and the caller decides what to keep: the reach-back is the
-        entire cost of streaming, since those tokens are vocoded more than once.
-        The speaker prompt is prepended by the flow module on every call, so
-        timbre and level do not drift between chunks the way they would if each
-        chunk were conditioned on nothing.
-
-        `flow_cache` and `carry_frames` hand the flow decoder the noise and the
-        encoder output the overlapping tokens had in the previous window, so
-        that this window's new content continues from the same state instead of
-        starting a second reading of the same words. Pass the previous call's
-        second return value, and ask for `carry_frames` equal to the overlap in
-        mel frames -- `context_tokens * token_mel_ratio` -- or the cache will
-        land on tokens it was not made for.
-
-        `noise` is the flow's starting point. Supplying the same tape for the
-        same tokens does **not** make two windows agree; the cache is what does.
+        A piece is produced by decoding a window that reaches back into audio
+        already sent, and the caller decides what to keep. The reach-back gives
+        the flow decoder history to start from, and it is the cost of streaming,
+        since those tokens are vocoded more than once. The speaker prompt is
+        prepended by the flow module on every call, so timbre and level do not
+        drift between pieces. Two renderings of the same tokens are never the
+        same waveform, which is why the caller drops the overlap rather than
+        joining to it.
         """
         window = torch.tensor(tokens, dtype=torch.long, device=self.device)
-        mels, next_cache = self.s3gen.flow_inference(
-            speech_tokens=window, ref_dict=self.conds.gen, finalize=True,
-            noise=noise, flow_cache=flow_cache, carry_frames=carry_frames)
-        wav, _ = self.s3gen.hift_inference(mels.to(dtype=self.s3gen.dtype), None)
-        # Same spillover fade `s3gen.inference` applies. It lands inside the
-        # overlap of every window but the first, which the caller drops.
-        wav[:, :len(self.s3gen.trim_fade)] *= self.s3gen.trim_fade
-        wav = wav.squeeze(0).detach().float().cpu().numpy()
+        wav, _ = self.s3gen.inference(speech_tokens=window, ref_dict=self.conds.gen)
+        wav = wav.squeeze(0).detach().cpu().numpy()
         if drop_tail_tokens:
             samples_per_token = S3GEN_SR // S3_TOKEN_RATE
             # Token boundaries sit `lead_samples` earlier in this audio than
             # their count says; see `audio_lead`.
             wav = wav[: max(1, (len(tokens) - drop_tail_tokens) * samples_per_token - lead_samples)]
-        return wav, next_cache
+        return wav
 
     def generate_stream(
         self,
@@ -546,64 +466,32 @@ class ChatterboxMultilingualTTS:
         first_chunk_tokens=25,
         chunk_growth=1.5,
         context_tokens=50,
-        crossfade_ms=0.0,
-        quiet_cut_ms=400.0,
         pause_search_ms=0.0,
         max_new_tokens=None,
         watermark=True,
-        carry_state=False,
     ):
         """Yield audio while the utterance is still being sampled.
 
         `generate` returns when the last token has been vocoded; this returns
-        the first second of speech while the rest is still being thought of. The
-        model is unchanged and so is the audio it produces -- what changes is
-        when the bytes leave.
+        speech while the rest is still being thought of. The model is unchanged;
+        what changes is when the bytes leave.
 
         Speech tokens arrive at twenty-five a second, so `chunk_tokens` is that
         many twenty-fifths of a second of audio per yield. `context_tokens` is how
-        far each decode reaches back into audio already sent: it gives the flow
-        decoder the history to start a window from, and with `carry_state` it is
-        also the region whose noise and encoder output are pinned to what the
-        previous window used, so the new content continues that window's reading
-        instead of beginning its own. Two renderings of the overlap never agree
-        -- measured, they are different audio -- which is why the overlap is
-        dropped rather than joined to, and why the pin is about the *state* the
-        new content starts from. `crossfade_ms` fades the two renderings across
-        each other and defaults to zero: measured at 50 tokens of overlap it
-        made the seam very slightly worse rather than better -- see `splice`.
+        far each decode reaches back into audio already sent, to give the flow
+        decoder history to start from; the overlap is rendered again and dropped.
 
-        `first_chunk_tokens` exists because a chunk costs a fixed amount to
-        vocode whatever its size, so small chunks are expensive per second of
-        speech -- and the only chunk whose size really matters to a listener is
-        the first, because it is the one they are waiting for in silence. Small
-        first, large afterwards.
+        `first_chunk_tokens` and `chunk_growth` let the opening piece be smaller
+        than the rest and grow towards `chunk_tokens`. The service ships them
+        equal, at 100 (owner decision 2026-09-12): the opening piece is the
+        player's whole margin, and a pause is only within reach of a large piece.
 
-        `quiet_cut_ms` is how far back the boundary may move to find a quiet
-        place to fall in. A chunk boundary is a switch between two renderings,
-        and inside a vowel that is audible however small the step is; in a pause
-        it is not. Zero keeps the schedule's own boundary.
+        `pause_search_ms` is how far back a piece may end so that the switch
+        between two renderings falls in a pause; see `quietest_boundary`. Zero
+        ends every piece on the schedule, which puts the switch in sound five
+        times in seven. With it, the owner could not hear the joins.
 
-        That paragraph describes the intent; measured, `quiet_cut_ms` does not
-        move the switch between renderings. Withheld audio is still the previous
-        window's, so the stream changes renderings exactly on the scheduled token
-        either way, and what moves is only where the bytes -- and the per-piece
-        watermark -- are cut. `pause_search_ms` moves the switch itself: see
-        `quietest_boundary`. When it is set, `quiet_cut_ms` is ignored.
-
-        `carry_state` is the flow decoder's carry, described in
-        `_vocode_window`. It is **off** because it buys nothing audible: through
-        the production path, with stress marks, readings with and without it are
-        equally good and keep the same minimal stutter. Kept for reproducibility.
-
-        `chunk_growth` is how fast "afterwards" arrives. Jumping straight from a
-        small opening chunk to a large one hands the player a second of audio and
-        then makes it wait four, so each chunk instead grows by this factor until
-        it reaches `chunk_tokens`. 1.0 means no ramp: every chunk the size of the
-        first one.
-
-        Yields (1, N) float tensors at `self.sr`, in order, which concatenate into
-        the same utterance `generate` would have returned.
+        Yields (1, N) float tensors at `self.sr`, in order.
         """
         self._validate_language(language_id)
         text_tokens = self._prepare_for_generation(text, language_id, audio_prompt_path, exaggeration)
@@ -611,53 +499,28 @@ class ChatterboxMultilingualTTS:
         samples_per_token = S3GEN_SR // S3_TOKEN_RATE
         start_token = self.t3.hp.start_speech_token
         stop_token = self.t3.hp.stop_speech_token
-        fade = max(0, int(crossfade_ms * S3GEN_SR / 1000))
-        search = max(0, int(quiet_cut_ms * S3GEN_SR / 1000))
-        quiet_frame = int(0.010 * S3GEN_SR)
         pause_search = max(0, int(pause_search_ms * S3GEN_SR / 1000))
         # Every window's audio starts this many samples after its first token,
         # and every boundary below is counted in that window's own samples.
         lead = audio_lead(self.conds.gen["prompt_feat"].size(1),
                           self.conds.gen["prompt_token"].size(-1),
                           self.s3gen.flow.token_mel_ratio, samples_per_token)
-        # The pinned region has to be the overlap exactly, in mel frames.
-        carry_frames = context_tokens * self.s3gen.flow.token_mel_ratio if carry_state else 0
-        produced, sent, held, carried = [], 0, None, None
+        produced, sent = [], 0
 
         def piece(final):
-            """Vocode what has accumulated, fade it onto the withheld tail, keep a new one."""
-            nonlocal sent, held, carried
+            """Vocode what has accumulated and emit what has not been sent."""
+            nonlocal sent
             window_start = max(0, sent - context_tokens)
-            # Only a window reaching back exactly the carried distance can take
-            # the cache; the first reaches back nothing, and a cache there
-            # would pin the start of new speech to the wrong tokens.
-            full_reach = sent - window_start == context_tokens
-            wav, carried = self._vocode_window(
-                produced[window_start:], drop_tail_tokens=1 if final else 0,
-                lead_samples=lead,
-                flow_cache=carried if full_reach else None,
-                carry_frames=0 if final else carry_frames)
-            boundary = emit_from(sent, window_start, samples_per_token, lead)
-            reach = min(fade, boundary) if held is not None else 0
-            overlap, body = wav[boundary - reach:boundary], wav[boundary:]
+            wav = self._vocode_window(produced[window_start:],
+                                      drop_tail_tokens=1 if final else 0, lead_samples=lead)
+            audio = wav[emit_from(sent, window_start, samples_per_token, lead):]
             emitted_to = len(produced)
-            if final:
-                audio, held = splice(held, overlap, body), None
-            elif pause_search:
+            if pause_search and not final:
                 # End on a quiet token boundary and let the next window render
                 # from there, so the switch itself falls in the pause.
-                kept_back = quietest_boundary(body, pause_search, samples_per_token)
-                audio = splice(held, overlap, body[:len(body) - kept_back * samples_per_token])
-                held = None
+                kept_back = quietest_boundary(audio, pause_search, samples_per_token)
+                audio = audio[:len(audio) - kept_back * samples_per_token]
                 emitted_to -= kept_back
-            else:
-                # Hold back the end of this chunk so the join lands somewhere
-                # quiet, and at least enough for the fade if one is configured.
-                # Once audio is on the wire the boundary cannot be moved.
-                keep = max(quietest_cut(body, search, quiet_frame), min(fade, len(body)))
-                keep = min(keep, len(body))
-                audio = splice(held, overlap, body[:len(body) - keep])
-                held = body[len(body) - keep:] if keep else None
             sent = emitted_to
             if watermark:
                 audio = self.watermarker.apply_watermark(audio, sample_rate=self.sr)
@@ -689,10 +552,6 @@ class ChatterboxMultilingualTTS:
                     want = min(chunk_tokens, max(want + 1, int(want * chunk_growth)))
 
             # The last token's audio is dropped: it is emitted just before EOS
-            # with degraded attention and decodes to ~40 ms of noise. What was
-            # held back still has to go out, whether or not anything follows it.
+            # with degraded attention and decodes to ~40 ms of noise.
             if len(produced) - 1 > sent:
                 yield piece(final=True)
-            elif held is not None and len(held):
-                audio = self.watermarker.apply_watermark(held, sample_rate=self.sr)                     if watermark else held
-                yield torch.from_numpy(np.ascontiguousarray(audio)).unsqueeze(0)
