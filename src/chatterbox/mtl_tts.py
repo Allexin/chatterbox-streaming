@@ -3,6 +3,7 @@ from pathlib import Path
 import os
 
 import librosa
+import numpy as np
 import torch
 import perth
 import torch.nn.functional as F
@@ -108,6 +109,32 @@ def punc_norm(text: str) -> str:
         text += "."
 
     return text
+
+
+def splice(tail, overlap, following):
+    """Join two independent renderings of the same speech without a click.
+
+    The vocoder starts from noise, so decoding one token twice gives two
+    different waveforms of the same sound. Butting them together at an arbitrary
+    sample leaves a step, and a step is a click. `overlap` is the new rendering
+    of the region `tail` already covers, so the two can be faded across each
+    other instead -- which costs nothing, because that audio was decoded anyway
+    and used to be thrown away.
+
+    With no overlap to work with (`context_tokens` of zero) there is nothing to
+    fade and the pieces are concatenated as they are. That is the old behaviour
+    and it is the honest consequence of asking for no overlap.
+    """
+    if tail is None or not len(tail):
+        return np.concatenate([overlap, following])
+    if not len(overlap):
+        return np.concatenate([tail, following])
+    width = min(len(tail), len(overlap))
+    # Raised cosine: equal amplitude through the join for material this
+    # correlated, and no discontinuity in the slope at either end.
+    rising = 0.5 - 0.5 * np.cos(np.pi * (np.arange(width) + 0.5) / width)
+    joined = tail[-width:] * (1.0 - rising) + overlap[-width:] * rising
+    return np.concatenate([joined, following])
 
 
 @dataclass
@@ -362,28 +389,24 @@ class ChatterboxMultilingualTTS:
             watermarked_wav = self.watermarker.apply_watermark(wav, sample_rate=self.sr)
         return torch.from_numpy(watermarked_wav).unsqueeze(0)
 
-    def _vocode_window(self, tokens, already_sent, drop_tail_tokens=0, watermark=True):
-        """Vocode a window of speech tokens and return only the audio that is new.
+    def _vocode_window(self, tokens, drop_tail_tokens=0):
+        """Vocode a window of speech tokens and return the whole window's audio.
 
         There is no incremental cache in this vocoder, so a chunk is produced by
-        decoding a window that reaches back into audio already sent and then
-        dropping the part that was already sent. The overlap is what keeps the
-        seam inaudible, and it is also the entire cost of streaming: those
-        tokens are vocoded more than once. The speaker prompt is prepended by
-        the flow module on every call, so timbre and level do not drift between
-        chunks the way they would if each chunk were conditioned on nothing.
+        decoding a window that reaches back into audio already sent. The caller
+        decides what to keep: the reach-back is what `splice` fades across, and
+        it is the entire cost of streaming, since those tokens are vocoded more
+        than once. The speaker prompt is prepended by the flow module on every
+        call, so timbre and level do not drift between chunks the way they would
+        if each chunk were conditioned on nothing.
         """
         window = torch.tensor(tokens, dtype=torch.long, device=self.device)
         wav, _ = self.s3gen.inference(speech_tokens=window, ref_dict=self.conds.gen)
         wav = wav.squeeze(0).detach().cpu().numpy()
-
-        samples_per_token = S3GEN_SR // S3_TOKEN_RATE
         if drop_tail_tokens:
+            samples_per_token = S3GEN_SR // S3_TOKEN_RATE
             wav = wav[: max(1, len(tokens) - drop_tail_tokens) * samples_per_token]
-        wav = wav[already_sent * samples_per_token:]
-        if watermark:
-            wav = self.watermarker.apply_watermark(wav, sample_rate=self.sr)
-        return torch.from_numpy(wav).unsqueeze(0)
+        return wav
 
     def generate_stream(
         self,
@@ -400,6 +423,7 @@ class ChatterboxMultilingualTTS:
         first_chunk_tokens=25,
         chunk_growth=1.5,
         context_tokens=50,
+        crossfade_ms=10.0,
         watermark=True,
     ):
         """Yield audio while the utterance is still being sampled.
@@ -411,9 +435,11 @@ class ChatterboxMultilingualTTS:
 
         Speech tokens arrive at twenty-five a second, so `chunk_tokens` is that
         many twenty-fifths of a second of audio per yield. `context_tokens` is how
-        far each decode reaches back into audio already sent; it is thrown away
-        afterwards and exists only so the vocoder starts a window with the right
-        history.
+        far each decode reaches back into audio already sent: it gives the vocoder
+        the right history to start a window from, and `crossfade_ms` of it is
+        faded across the join so the seam has no step in it. With
+        `context_tokens` at zero there is no overlap and therefore no fade, and
+        the pieces are butted together -- which is audible.
 
         `first_chunk_tokens` exists because a chunk costs a fixed amount to
         vocode whatever its size, so small chunks are expensive per second of
@@ -433,11 +459,35 @@ class ChatterboxMultilingualTTS:
         self._validate_language(language_id)
         text_tokens = self._prepare_for_generation(text, language_id, audio_prompt_path, exaggeration)
 
+        samples_per_token = S3GEN_SR // S3_TOKEN_RATE
         start_token = self.t3.hp.start_speech_token
         stop_token = self.t3.hp.stop_speech_token
-        produced, sent = [], 0
-        want = min(first_chunk_tokens, chunk_tokens)
+        fade = max(0, int(crossfade_ms * S3GEN_SR / 1000))
+        produced, sent, held = [], 0, None
 
+        def piece(final):
+            """Vocode what has accumulated, fade it onto the withheld tail, keep a new one."""
+            nonlocal sent, held
+            window_start = max(0, sent - context_tokens)
+            wav = self._vocode_window(produced[window_start:],
+                                      drop_tail_tokens=1 if final else 0)
+            boundary = (sent - window_start) * samples_per_token
+            reach = min(fade, boundary) if held is not None else 0
+            overlap, body = wav[boundary - reach:boundary], wav[boundary:]
+            if final:
+                audio, held = splice(held, overlap, body), None
+            else:
+                # Hold back the last few milliseconds: they are what the next
+                # chunk fades onto, and once they are on the wire they cannot be.
+                keep = min(fade, len(body))
+                audio = splice(held, overlap, body[:len(body) - keep])
+                held = body[len(body) - keep:] if keep else None
+            sent = len(produced)
+            if watermark:
+                audio = self.watermarker.apply_watermark(audio, sample_rate=self.sr)
+            return torch.from_numpy(np.ascontiguousarray(audio)).unsqueeze(0)
+
+        want = min(first_chunk_tokens, chunk_tokens)
         with torch.inference_mode():
             for token in self.t3.inference_stream(
                 t3_cond=self.conds.t3,
@@ -458,16 +508,15 @@ class ChatterboxMultilingualTTS:
                 produced.append(value)
                 if len(produced) - sent < want:
                     continue
-                window_start = max(0, sent - context_tokens)
-                yield self._vocode_window(produced[window_start:], sent - window_start,
-                                          watermark=watermark)
-                sent = len(produced)
+                yield piece(final=False)
                 if chunk_growth > 1.0:
                     want = min(chunk_tokens, max(want + 1, int(want * chunk_growth)))
 
-            # The tail, with the last token's audio dropped: it is emitted just
-            # before EOS with degraded attention and decodes to ~40 ms of noise.
+            # The last token's audio is dropped: it is emitted just before EOS
+            # with degraded attention and decodes to ~40 ms of noise. What was
+            # held back still has to go out, whether or not anything follows it.
             if len(produced) - 1 > sent:
-                window_start = max(0, sent - context_tokens)
-                yield self._vocode_window(produced[window_start:], sent - window_start,
-                                          drop_tail_tokens=1, watermark=watermark)
+                yield piece(final=True)
+            elif held is not None and len(held):
+                audio = self.watermarker.apply_watermark(held, sample_rate=self.sr)                     if watermark else held
+                yield torch.from_numpy(np.ascontiguousarray(audio)).unsqueeze(0)
