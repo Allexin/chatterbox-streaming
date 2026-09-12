@@ -143,6 +143,40 @@ def quietest_cut(audio, search, frame):
     return int((frames - int(quiet[-1])) * frame) if len(quiet) else 0
 
 
+def quietest_boundary(audio, search, per_token, lookahead=3):
+    """How many whole tokens to leave to the next window, so the switch lands in a pause.
+
+    `quietest_cut` moves where the bytes are cut, and that turned out not to be
+    where the stream changes renderings: withheld audio is still this window's,
+    so the switch stays on the scheduled token. This moves the switch. The piece
+    ends on a token boundary -- the one place two renderings of one token
+    sequence line up by construction -- and the next window renders from there.
+
+    Each candidate boundary is scored by the level of the two tokens around it,
+    80 ms, which is long enough that the closure of a stop consonant inside a
+    word does not pass for a pause. The latest boundary within 1.5x of the
+    quietest wins, for the same reason as in `quietest_cut`.
+
+    Never fewer than `lookahead` tokens are left: the flow encoder looks three
+    tokens ahead, and a window's last three are rendered without that, so they
+    are the worst audio in it and are better re-rendered by the next window.
+    Never more than half of what is on offer.
+    """
+    tokens = len(audio) // per_token
+    half = tokens // 2
+    most = min(search // per_token, half)
+    if most < lookahead:
+        return min(lookahead, half)
+    levels = []
+    for kept_back in range(lookahead, most + 1):
+        boundary = (tokens - kept_back) * per_token
+        around = audio[boundary - per_token:boundary + per_token]
+        levels.append(float(np.sqrt(np.mean(around ** 2))))
+    levels = np.asarray(levels)
+    quiet = np.flatnonzero(levels <= levels.min() * 1.5 + 1e-4)
+    return lookahead + int(quiet[0])
+
+
 def splice(tail, overlap, following):
     """Fade two renderings of the same speech across each other. Off by default.
 
@@ -482,6 +516,7 @@ class ChatterboxMultilingualTTS:
         context_tokens=50,
         crossfade_ms=0.0,
         quiet_cut_ms=400.0,
+        pause_search_ms=0.0,
         max_new_tokens=None,
         watermark=True,
         carry_state=False,
@@ -517,6 +552,13 @@ class ChatterboxMultilingualTTS:
         and inside a vowel that is audible however small the step is; in a pause
         it is not. Zero keeps the schedule's own boundary.
 
+        That paragraph describes the intent; measured, `quiet_cut_ms` does not
+        move the switch between renderings. Withheld audio is still the previous
+        window's, so the stream changes renderings exactly on the scheduled token
+        either way, and what moves is only where the bytes -- and the per-piece
+        watermark -- are cut. `pause_search_ms` moves the switch itself: see
+        `quietest_boundary`. When it is set, `quiet_cut_ms` is ignored.
+
         `carry_state` is the flow decoder's carry, described in
         `_vocode_window`. It is **off** because it buys nothing audible: through
         the production path, with stress marks, readings with and without it are
@@ -540,6 +582,7 @@ class ChatterboxMultilingualTTS:
         fade = max(0, int(crossfade_ms * S3GEN_SR / 1000))
         search = max(0, int(quiet_cut_ms * S3GEN_SR / 1000))
         quiet_frame = int(0.010 * S3GEN_SR)
+        pause_search = max(0, int(pause_search_ms * S3GEN_SR / 1000))
         # The pinned region has to be the overlap exactly, in mel frames.
         carry_frames = context_tokens * self.s3gen.flow.token_mel_ratio if carry_state else 0
         produced, sent, held, carried = [], 0, None, None
@@ -559,8 +602,16 @@ class ChatterboxMultilingualTTS:
             boundary = (sent - window_start) * samples_per_token
             reach = min(fade, boundary) if held is not None else 0
             overlap, body = wav[boundary - reach:boundary], wav[boundary:]
+            emitted_to = len(produced)
             if final:
                 audio, held = splice(held, overlap, body), None
+            elif pause_search:
+                # End on a quiet token boundary and let the next window render
+                # from there, so the switch itself falls in the pause.
+                kept_back = quietest_boundary(body, pause_search, samples_per_token)
+                audio = splice(held, overlap, body[:len(body) - kept_back * samples_per_token])
+                held = None
+                emitted_to -= kept_back
             else:
                 # Hold back the end of this chunk so the join lands somewhere
                 # quiet, and at least enough for the fade if one is configured.
@@ -569,7 +620,7 @@ class ChatterboxMultilingualTTS:
                 keep = min(keep, len(body))
                 audio = splice(held, overlap, body[:len(body) - keep])
                 held = body[len(body) - keep:] if keep else None
-            sent = len(produced)
+            sent = emitted_to
             if watermark:
                 audio = self.watermarker.apply_watermark(audio, sample_rate=self.sr)
             return torch.from_numpy(np.ascontiguousarray(audio)).unsqueeze(0)
