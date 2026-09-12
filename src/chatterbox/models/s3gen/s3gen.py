@@ -182,6 +182,8 @@ class S3Token2Mel(torch.nn.Module):
         finalize: bool = False,
         speech_token_lens=None,
         noised_mels=None,
+        flow_cache=None,
+        carry_frames=0,
     ):
         """
         Generate waveforms from S3 speech tokens and a reference waveform, which the speaker timbre is inferred from.
@@ -198,6 +200,10 @@ class S3Token2Mel(torch.nn.Module):
         - `ref_wav`: reference waveform (`torch.Tensor` with shape=[B=1, T])
         - `ref_sr`: reference sample rate
         - `finalize`: whether streaming is finished or not. Note that if False, the last 3 tokens will be ignored.
+        - `flow_cache`, `carry_frames`: the flow decoder's carried state, for a
+          caller decoding one utterance in pieces. See
+          `CausalConditionalCFM.forward`, which owns the mechanism and the
+          arithmetic the caller has to respect. Returned alongside the mels.
         """
         assert (ref_wav is None) ^ (ref_dict is None), f"Must provide exactly one of ref_wav or ref_dict (got {ref_wav} and {ref_dict})"
 
@@ -217,16 +223,18 @@ class S3Token2Mel(torch.nn.Module):
         if speech_token_lens is None:
             speech_token_lens = torch.LongTensor([st.size(-1) for st in speech_tokens]).to(self.device)
 
-        output_mels, _ = self.flow.inference(
+        output_mels, next_cache = self.flow.inference(
             token=speech_tokens,
             token_len=speech_token_lens,
             finalize=finalize,
             noised_mels=noised_mels,
             n_timesteps=n_cfm_timesteps,
             meanflow=self.meanflow,
+            flow_cache=flow_cache,
+            carry_frames=carry_frames,
             **ref_dict,
         )
-        return output_mels
+        return output_mels, next_cache
 
 
 class S3Token2Wav(S3Token2Mel):
@@ -277,7 +285,7 @@ class S3Token2Wav(S3Token2Mel):
         Generate waveforms from S3 speech tokens and a reference waveform, which the speaker timbre is inferred from.
         NOTE: used for sync synthesis only. Please use `S3GenStreamer` for streaming synthesis.
         """
-        output_mels = super().forward(
+        output_mels, _ = super().forward(
             speech_tokens, speech_token_lens=speech_token_lens, ref_wav=ref_wav,
             ref_sr=ref_sr, ref_dict=ref_dict, finalize=finalize,
             n_cfm_timesteps=n_cfm_timesteps, noised_mels=noised_mels,
@@ -310,22 +318,30 @@ class S3Token2Wav(S3Token2Mel):
         finalize: bool = False,
         speech_token_lens=None,
         noise=None,
+        flow_cache=None,
+        carry_frames=0,
     ):
+        """Token-to-mel, and the streaming entry point.
+
+        `noise` is the flow's starting point for the generated frames, two per
+        speech token. Left unset the decoder draws its own, fresh on every call.
+        Supplying the same slice of one tape for the same tokens is **not**
+        enough to make two windows agree: measured, it brings two decodes of the
+        identical window from +1.0 dB apart to -4.6 dB, and leaves two different
+        windows at +0.5 dB, which is unrelated audio. The flow encoder is
+        bidirectional, so `mu` for a shared token differs with the window it was
+        encoded in, and no amount of noise control reaches that. `flow_cache`
+        and `carry_frames` are the mechanism that does, by pinning both halves;
+        `noise` stays because the decoder needs somewhere to put `z`.
+        """
         n_cfm_timesteps = n_cfm_timesteps or (2 if self.meanflow else 10)
-        # `noise` is the flow's starting point for the generated frames, two per
-        # speech token. Left unset the decoder draws its own, fresh on every
-        # call -- correct for one utterance and wrong for a stream: decoding the
-        # same token twice then gives two renderings that are not aligned in
-        # time, and a listener hears that at every chunk boundary as a stutter.
-        # A caller decoding overlapping windows passes the same slice of one
-        # tape for the same tokens and gets the same audio back.
         if noise is None and self.meanflow:
             noise = torch.randn(1, 80, speech_tokens.size(-1) * 2, dtype=self.dtype, device=self.device)
-        output_mels = super().forward(
+        return super().forward(
             speech_tokens, speech_token_lens=speech_token_lens, ref_wav=ref_wav, ref_sr=ref_sr, ref_dict=ref_dict,
             n_cfm_timesteps=n_cfm_timesteps, finalize=finalize, noised_mels=noise,
+            flow_cache=flow_cache, carry_frames=carry_frames,
         )
-        return output_mels
 
     @torch.inference_mode()
     def hift_inference(self, speech_feat, cache_source: torch.Tensor = None):
@@ -352,7 +368,7 @@ class S3Token2Wav(S3Token2Mel):
         # if drop_invalid_tokens:
         #     speech_tokens, speech_token_lens = drop_invalid(speech_tokens, pad=S3_QUIET_PAD)
 
-        output_mels = self.flow_inference(
+        output_mels, _ = self.flow_inference(
             speech_tokens,
             speech_token_lens=speech_token_lens,
             ref_wav=ref_wav,

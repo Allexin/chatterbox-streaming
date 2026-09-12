@@ -140,7 +140,9 @@ class CausalMaskedDiffWithXvec(torch.nn.Module):
                   finalize,
                   n_timesteps=10,
                   noised_mels=None,
-                  meanflow=False):
+                  meanflow=False,
+                  flow_cache=None,
+                  carry_frames=0):
         # token: (B, n_toks)
         # token_len: (B,)
         B = token.size(0)
@@ -184,7 +186,7 @@ class CausalMaskedDiffWithXvec(torch.nn.Module):
         if mask.shape[0] != B:
             mask = mask.repeat(B, 1, 1)
 
-        feat, _ = self.decoder(
+        feat, next_cache = self.decoder(
             mu=h.transpose(1, 2).contiguous(),
             mask=mask,
             spks=embedding,
@@ -192,7 +194,13 @@ class CausalMaskedDiffWithXvec(torch.nn.Module):
             n_timesteps=n_timesteps,
             noised_mels=noised_mels,
             meanflow=meanflow,
+            prompt_len=mel_len1,
+            flow_cache=flow_cache,
+            carry_frames=carry_frames,
         )
         feat = feat[:, :, mel_len1:]
         assert feat.shape[2] == mel_len2
-        return feat, None  # NOTE jrm: why are they returning None here?
+        # The second element is the decoder's carried state, empty unless a
+        # caller asked for it with `carry_frames`. Upstream returned None here
+        # and wondered why in a comment; this is what belongs in the slot.
+        return feat, next_cache
