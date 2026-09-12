@@ -518,8 +518,9 @@ class ChatterboxMultilingualTTS:
         it is not. Zero keeps the schedule's own boundary.
 
         `carry_state` is the flow decoder's carry, described in
-        `_vocode_window`. It is **off**: the owner heard it badly degrade the whole
-        reading, against the same tokens without it. Kept for reproducibility.
+        `_vocode_window`. It is **off** because it buys nothing audible: through
+        the production path, with stress marks, readings with and without it are
+        equally good and keep the same minimal stutter. Kept for reproducibility.
 
         `chunk_growth` is how fast "afterwards" arrives. Jumping straight from a
         small opening chunk to a large one hands the player a second of audio and
