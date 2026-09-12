@@ -429,31 +429,41 @@ class ChatterboxMultilingualTTS:
             watermarked_wav = self.watermarker.apply_watermark(wav, sample_rate=self.sr)
         return torch.from_numpy(watermarked_wav).unsqueeze(0)
 
-    def _vocode_window(self, tokens, drop_tail_tokens=0, noise=None):
-        """Vocode a window of speech tokens and return the whole window's audio.
+    def _vocode_window(self, tokens, drop_tail_tokens=0, noise=None,
+                       flow_cache=None, carry_frames=0):
+        """Vocode a window of speech tokens; return its audio and its carried state.
 
-        There is no incremental cache in this vocoder, so a chunk is produced by
-        decoding a window that reaches back into audio already sent. `noise` is the
-        flow's starting point, and supplying it does **not** make two windows
-        agree: measured, one shared tape brings two decodes of the *identical*
-        window from +1.0 dB apart to -4.6 dB, and leaves two different windows at
-        +0.5 dB, which is unrelated. The prompt's share of the noise is still
-        drawn fresh inside the decoder, and the flow encoder is bidirectional so
-        `mu` for a shared token differs with the window anyway. The parameter is
-        kept because the cached streaming path will want it. The caller
-        decides what to keep: the reach-back is what `splice` fades across, and
-        it is the entire cost of streaming, since those tokens are vocoded more
-        than once. The speaker prompt is prepended by the flow module on every
-        call, so timbre and level do not drift between chunks the way they would
-        if each chunk were conditioned on nothing.
+        A chunk is produced by decoding a window that reaches back into audio
+        already sent, and the caller decides what to keep: the reach-back is the
+        entire cost of streaming, since those tokens are vocoded more than once.
+        The speaker prompt is prepended by the flow module on every call, so
+        timbre and level do not drift between chunks the way they would if each
+        chunk were conditioned on nothing.
+
+        `flow_cache` and `carry_frames` hand the flow decoder the noise and the
+        encoder output the overlapping tokens had in the previous window, so
+        that this window's new content continues from the same state instead of
+        starting a second reading of the same words. Pass the previous call's
+        second return value, and ask for `carry_frames` equal to the overlap in
+        mel frames -- `context_tokens * token_mel_ratio` -- or the cache will
+        land on tokens it was not made for.
+
+        `noise` is the flow's starting point. Supplying the same tape for the
+        same tokens does **not** make two windows agree; the cache is what does.
         """
         window = torch.tensor(tokens, dtype=torch.long, device=self.device)
-        wav, _ = self.s3gen.inference(speech_tokens=window, ref_dict=self.conds.gen, noise=noise)
-        wav = wav.squeeze(0).detach().cpu().numpy()
+        mels, next_cache = self.s3gen.flow_inference(
+            speech_tokens=window, ref_dict=self.conds.gen, finalize=True,
+            noise=noise, flow_cache=flow_cache, carry_frames=carry_frames)
+        wav, _ = self.s3gen.hift_inference(mels.to(dtype=self.s3gen.dtype), None)
+        # Same spillover fade `s3gen.inference` applies. It lands inside the
+        # overlap of every window but the first, which the caller drops.
+        wav[:, :len(self.s3gen.trim_fade)] *= self.s3gen.trim_fade
+        wav = wav.squeeze(0).detach().float().cpu().numpy()
         if drop_tail_tokens:
             samples_per_token = S3GEN_SR // S3_TOKEN_RATE
             wav = wav[: max(1, len(tokens) - drop_tail_tokens) * samples_per_token]
-        return wav
+        return wav, next_cache
 
     def generate_stream(
         self,
@@ -474,6 +484,7 @@ class ChatterboxMultilingualTTS:
         quiet_cut_ms=400.0,
         max_new_tokens=None,
         watermark=True,
+        carry_state=True,
     ):
         """Yield audio while the utterance is still being sampled.
 
@@ -484,12 +495,16 @@ class ChatterboxMultilingualTTS:
 
         Speech tokens arrive at twenty-five a second, so `chunk_tokens` is that
         many twenty-fifths of a second of audio per yield. `context_tokens` is how
-        far each decode reaches back into audio already sent: it gives the vocoder
-        the history to start a window from, and at 50 it also makes the two
-        renderings of the overlap agree closely enough that the joins can simply
-        be butted together. `crossfade_ms` fades them across each other instead
-        and defaults to zero, because measured at 50 tokens of overlap it made
-        the seam very slightly worse rather than better -- see `splice`.
+        far each decode reaches back into audio already sent: it gives the flow
+        decoder the history to start a window from, and with `carry_state` it is
+        also the region whose noise and encoder output are pinned to what the
+        previous window used, so the new content continues that window's reading
+        instead of beginning its own. Two renderings of the overlap never agree
+        -- measured, they are different audio -- which is why the overlap is
+        dropped rather than joined to, and why the pin is about the *state* the
+        new content starts from. `crossfade_ms` fades the two renderings across
+        each other and defaults to zero: measured at 50 tokens of overlap it
+        made the seam very slightly worse rather than better -- see `splice`.
 
         `first_chunk_tokens` exists because a chunk costs a fixed amount to
         vocode whatever its size, so small chunks are expensive per second of
@@ -501,6 +516,10 @@ class ChatterboxMultilingualTTS:
         place to fall in. A chunk boundary is a switch between two renderings,
         and inside a vowel that is audible however small the step is; in a pause
         it is not. Zero keeps the schedule's own boundary.
+
+        `carry_state` is the flow decoder's carry, described in
+        `_vocode_window`. It costs nothing measurable; it is a parameter so that
+        a listening test can turn it off.
 
         `chunk_growth` is how fast "afterwards" arrives. Jumping straight from a
         small opening chunk to a large one hands the player a second of audio and
@@ -520,14 +539,22 @@ class ChatterboxMultilingualTTS:
         fade = max(0, int(crossfade_ms * S3GEN_SR / 1000))
         search = max(0, int(quiet_cut_ms * S3GEN_SR / 1000))
         quiet_frame = int(0.010 * S3GEN_SR)
-        produced, sent, held = [], 0, None
+        # The pinned region has to be the overlap exactly, in mel frames.
+        carry_frames = context_tokens * self.s3gen.flow.token_mel_ratio if carry_state else 0
+        produced, sent, held, carried = [], 0, None, None
 
         def piece(final):
             """Vocode what has accumulated, fade it onto the withheld tail, keep a new one."""
-            nonlocal sent, held
+            nonlocal sent, held, carried
             window_start = max(0, sent - context_tokens)
-            wav = self._vocode_window(produced[window_start:],
-                                      drop_tail_tokens=1 if final else 0)
+            # Only a window reaching back exactly the carried distance can take
+            # the cache; the first reaches back nothing, and a cache there
+            # would pin the start of new speech to the wrong tokens.
+            full_reach = sent - window_start == context_tokens
+            wav, carried = self._vocode_window(
+                produced[window_start:], drop_tail_tokens=1 if final else 0,
+                flow_cache=carried if full_reach else None,
+                carry_frames=0 if final else carry_frames)
             boundary = (sent - window_start) * samples_per_token
             reach = min(fade, boundary) if held is not None else 0
             overlap, body = wav[boundary - reach:boundary], wav[boundary:]

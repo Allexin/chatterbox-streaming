@@ -194,7 +194,14 @@ class CausalMaskedDiffWithXvec(torch.nn.Module):
             n_timesteps=n_timesteps,
             noised_mels=noised_mels,
             meanflow=meanflow,
-            prompt_len=mel_len1,
+            # Not mel_len1. The generated frames begin where the prompt
+            # *tokens* end, at prompt_token x token_mel_ratio, and for this
+            # reference that is 410 while mel_len1 is 411 -- the prompt mel is
+            # not exactly twice the prompt token length, and upstream slices the
+            # output by the mel count anyway. The cache is written onto `mu`, so
+            # it has to use the token grid or it lands a frame off the tokens it
+            # was made for.
+            prompt_len=prompt_token.size(1) * self.token_mel_ratio,
             flow_cache=flow_cache,
             carry_frames=carry_frames,
         )
