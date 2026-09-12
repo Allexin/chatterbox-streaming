@@ -484,7 +484,7 @@ class ChatterboxMultilingualTTS:
         quiet_cut_ms=400.0,
         max_new_tokens=None,
         watermark=True,
-        carry_state=True,
+        carry_state=False,
     ):
         """Yield audio while the utterance is still being sampled.
 
@@ -518,8 +518,8 @@ class ChatterboxMultilingualTTS:
         it is not. Zero keeps the schedule's own boundary.
 
         `carry_state` is the flow decoder's carry, described in
-        `_vocode_window`. It costs nothing measurable; it is a parameter so that
-        a listening test can turn it off.
+        `_vocode_window`. It is **off**: the owner heard it badly degrade the whole
+        reading, against the same tokens without it. Kept for reproducibility.
 
         `chunk_growth` is how fast "afterwards" arrives. Jumping straight from a
         small opening chunk to a large one hands the player a second of audio and
