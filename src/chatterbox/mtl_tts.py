@@ -173,6 +173,15 @@ def quietest_boundary(audio, search, per_token, lookahead=3):
         around = audio[boundary - per_token:boundary + per_token]
         levels.append(float(np.sqrt(np.mean(around ** 2))))
     levels = np.asarray(levels)
+    # Without a real pause in reach, "the latest boundary near the quietest" is
+    # just the latest boundary: when everything is loud, everything is within
+    # 1.5x of the minimum. Measured at 100-token pieces, that put two switches
+    # at 0.98 and 0.66 of the loud level. Then the quietest one it is.
+    width = 2 * per_token
+    frames = audio[:len(audio) // width * width].reshape(-1, width)
+    loud = float(np.percentile(np.sqrt((frames ** 2).mean(axis=1)), 90)) if len(frames) else 0.0
+    if levels.min() > 0.1 * loud:
+        return lookahead + int(np.argmin(levels))
     quiet = np.flatnonzero(levels <= levels.min() * 1.5 + 1e-4)
     return lookahead + int(quiet[0])
 
