@@ -309,10 +309,17 @@ class S3Token2Wav(S3Token2Mel):
         n_cfm_timesteps = None,
         finalize: bool = False,
         speech_token_lens=None,
+        noise=None,
     ):
         n_cfm_timesteps = n_cfm_timesteps or (2 if self.meanflow else 10)
-        noise = None
-        if self.meanflow:
+        # `noise` is the flow's starting point for the generated frames, two per
+        # speech token. Left unset the decoder draws its own, fresh on every
+        # call -- correct for one utterance and wrong for a stream: decoding the
+        # same token twice then gives two renderings that are not aligned in
+        # time, and a listener hears that at every chunk boundary as a stutter.
+        # A caller decoding overlapping windows passes the same slice of one
+        # tape for the same tokens and gets the same audio back.
+        if noise is None and self.meanflow:
             noise = torch.randn(1, 80, speech_tokens.size(-1) * 2, dtype=self.dtype, device=self.device)
         output_mels = super().forward(
             speech_tokens, speech_token_lens=speech_token_lens, ref_wav=ref_wav, ref_sr=ref_sr, ref_dict=ref_dict,
@@ -339,6 +346,7 @@ class S3Token2Wav(S3Token2Mel):
         drop_invalid_tokens=True,
         n_cfm_timesteps=None,
         speech_token_lens=None,
+        noise=None,
     ):
         # hallucination prevention, drop special tokens
         # if drop_invalid_tokens:
@@ -352,6 +360,7 @@ class S3Token2Wav(S3Token2Mel):
             ref_dict=ref_dict,
             n_cfm_timesteps=n_cfm_timesteps,
             finalize=True,
+            noise=noise,
         )
         output_mels = output_mels.to(dtype=self.dtype) # FIXME (fp16 mode) is this still needed?
         output_wavs, output_sources = self.hift_inference(output_mels, None)

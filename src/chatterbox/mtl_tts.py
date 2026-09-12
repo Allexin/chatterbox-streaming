@@ -429,11 +429,18 @@ class ChatterboxMultilingualTTS:
             watermarked_wav = self.watermarker.apply_watermark(wav, sample_rate=self.sr)
         return torch.from_numpy(watermarked_wav).unsqueeze(0)
 
-    def _vocode_window(self, tokens, drop_tail_tokens=0):
+    def _vocode_window(self, tokens, drop_tail_tokens=0, noise=None):
         """Vocode a window of speech tokens and return the whole window's audio.
 
         There is no incremental cache in this vocoder, so a chunk is produced by
-        decoding a window that reaches back into audio already sent. The caller
+        decoding a window that reaches back into audio already sent. `noise` is the
+        flow's starting point, and supplying it does **not** make two windows
+        agree: measured, one shared tape brings two decodes of the *identical*
+        window from +1.0 dB apart to -4.6 dB, and leaves two different windows at
+        +0.5 dB, which is unrelated. The prompt's share of the noise is still
+        drawn fresh inside the decoder, and the flow encoder is bidirectional so
+        `mu` for a shared token differs with the window anyway. The parameter is
+        kept because the cached streaming path will want it. The caller
         decides what to keep: the reach-back is what `splice` fades across, and
         it is the entire cost of streaming, since those tokens are vocoded more
         than once. The speaker prompt is prepended by the flow module on every
@@ -441,7 +448,7 @@ class ChatterboxMultilingualTTS:
         if each chunk were conditioned on nothing.
         """
         window = torch.tensor(tokens, dtype=torch.long, device=self.device)
-        wav, _ = self.s3gen.inference(speech_tokens=window, ref_dict=self.conds.gen)
+        wav, _ = self.s3gen.inference(speech_tokens=window, ref_dict=self.conds.gen, noise=noise)
         wav = wav.squeeze(0).detach().cpu().numpy()
         if drop_tail_tokens:
             samples_per_token = S3GEN_SR // S3_TOKEN_RATE
@@ -465,6 +472,7 @@ class ChatterboxMultilingualTTS:
         context_tokens=50,
         crossfade_ms=0.0,
         quiet_cut_ms=400.0,
+        max_new_tokens=None,
         watermark=True,
     ):
         """Yield audio while the utterance is still being sampled.
@@ -543,7 +551,7 @@ class ChatterboxMultilingualTTS:
             for token in self.t3.inference_stream(
                 t3_cond=self.conds.t3,
                 text_tokens=text_tokens,
-                max_new_tokens=None,
+                max_new_tokens=max_new_tokens,
                 temperature=temperature,
                 cfg_weight=cfg_weight,
                 repetition_penalty=repetition_penalty,
