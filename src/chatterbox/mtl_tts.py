@@ -143,6 +143,27 @@ def quietest_cut(audio, search, frame):
     return int((frames - int(quiet[-1])) * frame) if len(quiet) else 0
 
 
+def audio_lead(prompt_feat_frames, prompt_tokens, token_mel_ratio, per_token):
+    """Samples by which a window's audio starts after the token it was asked to start at.
+
+    `flow.inference` returns the frames after `mel_len1`, the prompt's mel
+    length, while the generated frames begin at `prompt_tokens x token_mel_ratio`.
+    For the reference voice those are 411 and 410, so every window's audio starts
+    one frame -- half a token, 20 ms -- late. Streaming that ignored it skipped
+    20 ms of speech at every join: measured 2026-09-12, the stream ran 0, 20, 40
+    and 60 ms ahead of a whole decode of the same tokens across its first four
+    pieces. Inside a word that is a stutter. The lead depends on the voice, and a
+    prompt whose mel is shorter than its tokens gives a negative one.
+    """
+    per_frame = per_token // token_mel_ratio
+    return (prompt_feat_frames - prompt_tokens * token_mel_ratio) * per_frame
+
+
+def emit_from(sent, window_start, per_token, lead):
+    """Where, in a window's own audio, the first token not yet sent begins."""
+    return max(0, (sent - window_start) * per_token - lead)
+
+
 def quietest_boundary(audio, search, per_token, lookahead=3):
     """How many whole tokens to leave to the next window, so the switch lands in a pause.
 
@@ -473,7 +494,7 @@ class ChatterboxMultilingualTTS:
         return torch.from_numpy(watermarked_wav).unsqueeze(0)
 
     def _vocode_window(self, tokens, drop_tail_tokens=0, noise=None,
-                       flow_cache=None, carry_frames=0):
+                       flow_cache=None, carry_frames=0, lead_samples=0):
         """Vocode a window of speech tokens; return its audio and its carried state.
 
         A chunk is produced by decoding a window that reaches back into audio
@@ -505,7 +526,9 @@ class ChatterboxMultilingualTTS:
         wav = wav.squeeze(0).detach().float().cpu().numpy()
         if drop_tail_tokens:
             samples_per_token = S3GEN_SR // S3_TOKEN_RATE
-            wav = wav[: max(1, len(tokens) - drop_tail_tokens) * samples_per_token]
+            # Token boundaries sit `lead_samples` earlier in this audio than
+            # their count says; see `audio_lead`.
+            wav = wav[: max(1, (len(tokens) - drop_tail_tokens) * samples_per_token - lead_samples)]
         return wav, next_cache
 
     def generate_stream(
@@ -592,6 +615,11 @@ class ChatterboxMultilingualTTS:
         search = max(0, int(quiet_cut_ms * S3GEN_SR / 1000))
         quiet_frame = int(0.010 * S3GEN_SR)
         pause_search = max(0, int(pause_search_ms * S3GEN_SR / 1000))
+        # Every window's audio starts this many samples after its first token,
+        # and every boundary below is counted in that window's own samples.
+        lead = audio_lead(self.conds.gen["prompt_feat"].size(1),
+                          self.conds.gen["prompt_token"].size(-1),
+                          self.s3gen.flow.token_mel_ratio, samples_per_token)
         # The pinned region has to be the overlap exactly, in mel frames.
         carry_frames = context_tokens * self.s3gen.flow.token_mel_ratio if carry_state else 0
         produced, sent, held, carried = [], 0, None, None
@@ -606,9 +634,10 @@ class ChatterboxMultilingualTTS:
             full_reach = sent - window_start == context_tokens
             wav, carried = self._vocode_window(
                 produced[window_start:], drop_tail_tokens=1 if final else 0,
+                lead_samples=lead,
                 flow_cache=carried if full_reach else None,
                 carry_frames=0 if final else carry_frames)
-            boundary = (sent - window_start) * samples_per_token
+            boundary = emit_from(sent, window_start, samples_per_token, lead)
             reach = min(fade, boundary) if held is not None else 0
             overlap, body = wav[boundary - reach:boundary], wav[boundary:]
             emitted_to = len(produced)
