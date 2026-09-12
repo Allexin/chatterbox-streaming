@@ -112,18 +112,25 @@ def punc_norm(text: str) -> str:
 
 
 def splice(tail, overlap, following):
-    """Join two independent renderings of the same speech without a click.
+    """Fade two renderings of the same speech across each other. Off by default.
 
-    The vocoder starts from noise, so decoding one token twice gives two
-    different waveforms of the same sound. Butting them together at an arbitrary
-    sample leaves a step, and a step is a click. `overlap` is the new rendering
-    of the region `tail` already covers, so the two can be faded across each
-    other instead -- which costs nothing, because that audio was decoded anyway
-    and used to be thrown away.
+    The reasoning that produced this was wrong and the measurement is worth
+    keeping. The vocoder starts from noise, so decoding one token twice gives
+    two different waveforms -- which sounds like it should make a butt-joint
+    click. Measured at six joins, it does not: with `context_tokens` at 50 the
+    step at a hard cut has a median of 0.116 of the local amplitude against 0.167
+    for ordinary speech in the same file. The overlap does not merely give the
+    vocoder history, it makes the two renderings agree, because both are
+    conditioned on the same preceding tokens. Fading them then *raised* the
+    median step to 0.189, since blending two slightly out-of-phase copies puts a
+    kink at each end of the window.
 
-    With no overlap to work with (`context_tokens` of zero) there is nothing to
-    fade and the pieces are concatenated as they are. That is the old behaviour
-    and it is the honest consequence of asking for no overlap.
+    So `crossfade_ms` defaults to zero and the joins are butted together, which
+    is what was measured good. What this is still for: it is the thing that would
+    make a *small* `context_tokens` safe. The overlap is the largest part of the
+    streaming overhead, and shrinking it is the obvious saving -- but with little
+    or no overlap the renderings stop agreeing, and then there is a step to fade.
+    Measure before turning it on.
     """
     if tail is None or not len(tail):
         return np.concatenate([overlap, following])
@@ -423,7 +430,7 @@ class ChatterboxMultilingualTTS:
         first_chunk_tokens=25,
         chunk_growth=1.5,
         context_tokens=50,
-        crossfade_ms=10.0,
+        crossfade_ms=0.0,
         watermark=True,
     ):
         """Yield audio while the utterance is still being sampled.
@@ -436,10 +443,11 @@ class ChatterboxMultilingualTTS:
         Speech tokens arrive at twenty-five a second, so `chunk_tokens` is that
         many twenty-fifths of a second of audio per yield. `context_tokens` is how
         far each decode reaches back into audio already sent: it gives the vocoder
-        the right history to start a window from, and `crossfade_ms` of it is
-        faded across the join so the seam has no step in it. With
-        `context_tokens` at zero there is no overlap and therefore no fade, and
-        the pieces are butted together -- which is audible.
+        the history to start a window from, and at 50 it also makes the two
+        renderings of the overlap agree closely enough that the joins can simply
+        be butted together. `crossfade_ms` fades them across each other instead
+        and defaults to zero, because measured at 50 tokens of overlap it made
+        the seam very slightly worse rather than better -- see `splice`.
 
         `first_chunk_tokens` exists because a chunk costs a fixed amount to
         vocode whatever its size, so small chunks are expensive per second of
