@@ -223,7 +223,18 @@ class T3(nn.Module):
         return loss_text, loss_speech
 
     @torch.inference_mode()
-    def inference(
+    def inference(self, **kwargs):
+        """Sample the whole utterance and return it as one tensor.
+
+        A thin wrapper over `inference_stream`, so the sampling loop exists once
+        and the streaming path cannot drift away from the batch one. Arguments
+        are `inference_stream`'s and are keyword-only.
+        """
+        predicted = list(self.inference_stream(**kwargs))
+        return torch.cat(predicted, dim=1)  # shape: (B, num_tokens)
+
+    @torch.inference_mode()
+    def inference_stream(
         self,
         *,
         t3_cond: T3Cond,
@@ -244,11 +255,18 @@ class T3(nn.Module):
         length_penalty=1.0,
         repetition_penalty=1.2,
         cfg_weight=0.5,
+        progress=True,
     ):
         """
         Args:
             text_tokens: a 1D (unbatched) or 2D (batched) tensor.
         """
+        # Upstream passed a hard 1000 here with a TODO beside it. The model's own
+        # configuration says 4096, and a cap below what the model can produce is a
+        # truncation that looks like a finished utterance.
+        if max_new_tokens is None:
+            max_new_tokens = self.hp.max_speech_tokens
+
         # Validate / sanitize inputs
         assert prepend_prompt_speech_tokens is None, "not implemented"
         _ensure_BOT_EOT(text_tokens, self.hp)
@@ -314,7 +332,6 @@ class T3(nn.Module):
 
         # Track generated token ids; start with the BOS token.
         generated_ids = bos_token.clone()
-        predicted = []  # To store the predicted tokens
 
         # Instantiate the logits processors.
         top_p_warper = TopPLogitsWarper(top_p=top_p)
@@ -335,7 +352,8 @@ class T3(nn.Module):
         past = output.past_key_values
 
         # ---- Generation Loop using kv_cache ----
-        for i in tqdm(range(max_new_tokens), desc="Sampling", dynamic_ncols=True):
+        for i in tqdm(range(max_new_tokens), desc="Sampling", dynamic_ncols=True,
+                      disable=not progress):
             logits_step = output.logits[:, -1, :]
             # CFG combine  → (1, V)
             cond   = logits_step[0:1, :]
@@ -359,7 +377,7 @@ class T3(nn.Module):
             probs = torch.softmax(logits, dim=-1)
             next_token = torch.multinomial(probs, num_samples=1)  # shape: (B, 1)
 
-            predicted.append(next_token)
+            yield next_token
             generated_ids = torch.cat([generated_ids, next_token], dim=1)
 
             # Check for EOS token.
@@ -385,9 +403,6 @@ class T3(nn.Module):
             # Update the kv_cache.
             past = output.past_key_values
 
-        # Concatenate all predicted tokens along the sequence dimension.
-        predicted_tokens = torch.cat(predicted, dim=1)  # shape: (B, num_tokens)
-        return predicted_tokens
 
     @torch.inference_mode()
     def inference_turbo(self, t3_cond, text_tokens, temperature=0.8, top_k=1000, top_p=0.95, repetition_penalty=1.2,

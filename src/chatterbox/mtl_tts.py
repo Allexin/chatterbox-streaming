@@ -277,26 +277,8 @@ class ChatterboxMultilingualTTS:
         ).to(device=self.device)
         self.conds = Conditionals(t3_cond, s3gen_ref_dict)
 
-    def generate(
-        self,
-        text,
-        language_id,
-        audio_prompt_path=None,
-        exaggeration=0.5,
-        cfg_weight=0.5,
-        temperature=0.8,
-        repetition_penalty=1.2,
-        min_p=0.05,
-        top_p=1.0,
-    ):
-        # Validate language_id
-        if language_id and language_id.lower() not in SUPPORTED_LANGUAGES:
-            supported_langs = ", ".join(SUPPORTED_LANGUAGES.keys())
-            raise ValueError(
-                f"Unsupported language_id '{language_id}'. "
-                f"Supported languages: {supported_langs}"
-            )
-        
+    def _prepare_for_generation(self, text, language_id, audio_prompt_path, exaggeration):
+        """Everything both generation paths do before a single token is sampled."""
         if audio_prompt_path:
             self.prepare_conditionals(audio_prompt_path, exaggeration=exaggeration)
         else:
@@ -320,12 +302,38 @@ class ChatterboxMultilingualTTS:
         eot = self.t3.hp.stop_text_token
         text_tokens = F.pad(text_tokens, (1, 0), value=sot)
         text_tokens = F.pad(text_tokens, (0, 1), value=eot)
+        return text_tokens
+
+    @staticmethod
+    def _validate_language(language_id):
+        if language_id and language_id.lower() not in SUPPORTED_LANGUAGES:
+            supported_langs = ", ".join(SUPPORTED_LANGUAGES.keys())
+            raise ValueError(
+                f"Unsupported language_id '{language_id}'. "
+                f"Supported languages: {supported_langs}"
+            )
+
+    def generate(
+        self,
+        text,
+        language_id,
+        audio_prompt_path=None,
+        exaggeration=0.5,
+        cfg_weight=0.5,
+        temperature=0.8,
+        repetition_penalty=1.2,
+        min_p=0.05,
+        top_p=1.0,
+    ):
+        self._validate_language(language_id)
+
+        text_tokens = self._prepare_for_generation(text, language_id, audio_prompt_path, exaggeration)
 
         with torch.inference_mode():
             speech_tokens = self.t3.inference(
                 t3_cond=self.conds.t3,
                 text_tokens=text_tokens,
-                max_new_tokens=1000,  # TODO: use the value in config
+                max_new_tokens=None,  # the model config's own ceiling
                 temperature=temperature,
                 cfg_weight=cfg_weight,
                 repetition_penalty=repetition_penalty,
@@ -353,3 +361,113 @@ class ChatterboxMultilingualTTS:
 
             watermarked_wav = self.watermarker.apply_watermark(wav, sample_rate=self.sr)
         return torch.from_numpy(watermarked_wav).unsqueeze(0)
+
+    def _vocode_window(self, tokens, already_sent, drop_tail_tokens=0, watermark=True):
+        """Vocode a window of speech tokens and return only the audio that is new.
+
+        There is no incremental cache in this vocoder, so a chunk is produced by
+        decoding a window that reaches back into audio already sent and then
+        dropping the part that was already sent. The overlap is what keeps the
+        seam inaudible, and it is also the entire cost of streaming: those
+        tokens are vocoded more than once. The speaker prompt is prepended by
+        the flow module on every call, so timbre and level do not drift between
+        chunks the way they would if each chunk were conditioned on nothing.
+        """
+        window = torch.tensor(tokens, dtype=torch.long, device=self.device)
+        wav, _ = self.s3gen.inference(speech_tokens=window, ref_dict=self.conds.gen)
+        wav = wav.squeeze(0).detach().cpu().numpy()
+
+        samples_per_token = S3GEN_SR // S3_TOKEN_RATE
+        if drop_tail_tokens:
+            wav = wav[: max(1, len(tokens) - drop_tail_tokens) * samples_per_token]
+        wav = wav[already_sent * samples_per_token:]
+        if watermark:
+            wav = self.watermarker.apply_watermark(wav, sample_rate=self.sr)
+        return torch.from_numpy(wav).unsqueeze(0)
+
+    def generate_stream(
+        self,
+        text,
+        language_id,
+        audio_prompt_path=None,
+        exaggeration=0.5,
+        cfg_weight=0.5,
+        temperature=0.8,
+        repetition_penalty=1.2,
+        min_p=0.05,
+        top_p=1.0,
+        chunk_tokens=100,
+        first_chunk_tokens=25,
+        chunk_growth=1.5,
+        context_tokens=50,
+        watermark=True,
+    ):
+        """Yield audio while the utterance is still being sampled.
+
+        `generate` returns when the last token has been vocoded; this returns
+        the first second of speech while the rest is still being thought of. The
+        model is unchanged and so is the audio it produces -- what changes is
+        when the bytes leave.
+
+        Speech tokens arrive at twenty-five a second, so `chunk_tokens` is that
+        many twenty-fifths of a second of audio per yield. `context_tokens` is how
+        far each decode reaches back into audio already sent; it is thrown away
+        afterwards and exists only so the vocoder starts a window with the right
+        history.
+
+        `first_chunk_tokens` exists because a chunk costs a fixed amount to
+        vocode whatever its size, so small chunks are expensive per second of
+        speech -- and the only chunk whose size really matters to a listener is
+        the first, because it is the one they are waiting for in silence. Small
+        first, large afterwards.
+
+        `chunk_growth` is how fast "afterwards" arrives. Jumping straight from a
+        small opening chunk to a large one hands the player a second of audio and
+        then makes it wait four, so each chunk instead grows by this factor until
+        it reaches `chunk_tokens`. 1.0 means no ramp: every chunk the size of the
+        first one.
+
+        Yields (1, N) float tensors at `self.sr`, in order, which concatenate into
+        the same utterance `generate` would have returned.
+        """
+        self._validate_language(language_id)
+        text_tokens = self._prepare_for_generation(text, language_id, audio_prompt_path, exaggeration)
+
+        start_token = self.t3.hp.start_speech_token
+        stop_token = self.t3.hp.stop_speech_token
+        produced, sent = [], 0
+        want = min(first_chunk_tokens, chunk_tokens)
+
+        with torch.inference_mode():
+            for token in self.t3.inference_stream(
+                t3_cond=self.conds.t3,
+                text_tokens=text_tokens,
+                max_new_tokens=None,
+                temperature=temperature,
+                cfg_weight=cfg_weight,
+                repetition_penalty=repetition_penalty,
+                min_p=min_p,
+                top_p=top_p,
+                progress=False,
+            ):
+                value = int(token.view(-1)[0])
+                if value == stop_token:
+                    break
+                if value == start_token:
+                    continue
+                produced.append(value)
+                if len(produced) - sent < want:
+                    continue
+                window_start = max(0, sent - context_tokens)
+                yield self._vocode_window(produced[window_start:], sent - window_start,
+                                          watermark=watermark)
+                sent = len(produced)
+                if chunk_growth > 1.0:
+                    want = min(chunk_tokens, max(want + 1, int(want * chunk_growth)))
+
+            # The tail, with the last token's audio dropped: it is emitted just
+            # before EOS with degraded attention and decodes to ~40 ms of noise.
+            if len(produced) - 1 > sent:
+                window_start = max(0, sent - context_tokens)
+                yield self._vocode_window(produced[window_start:], sent - window_start,
+                                          drop_tail_tokens=1, watermark=watermark)
