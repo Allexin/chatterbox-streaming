@@ -84,10 +84,24 @@ class T3(nn.Module):
         self.text_head = nn.Linear(self.cfg.hidden_size, hp.text_tokens_dict_size, bias=False)
         self.speech_head = nn.Linear(self.cfg.hidden_size, hp.speech_tokens_dict_size, bias=self.is_gpt)
         self.compiled = False
+        self.graphed_decoder = None
 
     @property
     def device(self):
         return self.speech_head.weight.device
+
+    def use_cuda_graphs(self, capacities=None):
+        """Decode speech tokens through recorded CUDA graphs; see `GraphedDecoder`.
+
+        The sampled tokens are the same as without, to the bit. Call once after
+        the model is on its CUDA device; it records the graphs immediately.
+        """
+        from .inference.graphed_decoder import DEFAULT_CAPACITIES, GraphedDecoder
+        if self.is_gpt or self.device.type != "cuda":
+            raise RuntimeError("CUDA graph decoding needs the Llama backbone on a CUDA device")
+        decoder = GraphedDecoder(self, capacities or DEFAULT_CAPACITIES)
+        decoder.capture()
+        self.graphed_decoder = decoder
 
     def prepare_conditioning(self, t3_cond: T3Cond):
         """
@@ -350,11 +364,20 @@ class T3(nn.Module):
         )
         # Initialize kv_cache with the full context.
         past = output.past_key_values
+        logits_step = output.logits[:, -1, :]
+
+        # With CUDA graphs the cache moves into the decoder's static buffer and
+        # the HF model is not called again unless the utterance outgrows it.
+        length = inputs_embeds.size(1)
+        decoder = self.graphed_decoder
+        graphed = decoder is not None and decoder.holds(length)
+        if graphed:
+            decoder.load(past, length)
+            past = None
 
         # ---- Generation Loop using kv_cache ----
         for i in tqdm(range(max_new_tokens), desc="Sampling", dynamic_ncols=True,
                       disable=not progress):
-            logits_step = output.logits[:, -1, :]
             # CFG combine  → (1, V)
             cond   = logits_step[0:1, :]
             uncond = logits_step[1:2, :]
@@ -392,6 +415,15 @@ class T3(nn.Module):
             #  For CFG
             next_token_embed = torch.cat([next_token_embed, next_token_embed])
 
+            position = length + i
+            if graphed and decoder.holds(position):
+                logits_step = decoder(next_token_embed, position)
+                continue
+            if graphed:
+                # Outgrew the largest bucket: continue in HF from the same cache.
+                past = decoder.to_dynamic_cache(position)
+                graphed = False
+
             # Forward pass with only the new token and the cached past.
             output = self.patched_model(
                 inputs_embeds=next_token_embed,
@@ -402,6 +434,7 @@ class T3(nn.Module):
             )
             # Update the kv_cache.
             past = output.past_key_values
+            logits_step = output.logits[:, -1, :]
 
 
     @torch.inference_mode()
