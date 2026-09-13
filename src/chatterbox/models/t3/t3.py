@@ -364,7 +364,10 @@ class T3(nn.Module):
         )
         # Initialize kv_cache with the full context.
         past = output.past_key_values
-        logits_step = output.logits[:, -1, :]
+        # Sampling runs in float32 whatever the backbone runs in: min_p and the
+        # softmax are thresholds on small probabilities. For a float32 backbone
+        # `.float()` returns the same tensor.
+        logits_step = output.logits[:, -1, :].float()
 
         # With CUDA graphs the cache moves into the decoder's static buffer and
         # the HF model is not called again unless the utterance outgrows it.
@@ -417,7 +420,7 @@ class T3(nn.Module):
 
             position = length + i
             if graphed and decoder.holds(position):
-                logits_step = decoder(next_token_embed, position)
+                logits_step = decoder(next_token_embed, position).float()
                 continue
             if graphed:
                 # Outgrew the largest bucket: continue in HF from the same cache.
@@ -434,7 +437,7 @@ class T3(nn.Module):
             )
             # Update the kv_cache.
             past = output.past_key_values
-            logits_step = output.logits[:, -1, :]
+            logits_step = output.logits[:, -1, :].float()
 
 
     @torch.inference_mode()
